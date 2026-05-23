@@ -205,6 +205,6 @@ MIT
 @software{canary2026,
   title  = {Canary: Pre-flight Hallucination Risk Detector},
   year   = {2026},
-  url    = {https://github.com/yourusername/canary-llm}
+  url    = {https://github.com/yoiyoicarnival/canary-llm}
 }
 ```
