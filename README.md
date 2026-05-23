@@ -1,5 +1,8 @@
 # Canary-LLM
 
+[![PyPI version](https://badge.fury.io/py/canary-llm.svg)](https://pypi.org/project/canary-llm/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **Lightweight pre-RAG routing for LLM applications.**  
 Detects out-of-domain queries before retrieval/tool use.  
 No GPU. Sub-100ms. Model-agnostic.
