@@ -1,10 +1,11 @@
 """
 Core scorer.  Lazy-loads GPT-2 on first call (~500 MB, CPU-only).
+Dependencies for route(): numpy, torch, transformers  (no scipy/sklearn)
+Dependencies for score(): + scikit-learn (PCA for gamma_h)
 """
 from __future__ import annotations
 import os, json, math
 from dataclasses import dataclass
-from typing import Optional
 import numpy as np
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -175,8 +176,13 @@ def _ensure_pca3d():
     bank = _state["bank"]
     embs = np.array([b["emb"] for b in bank])
     pca  = PCA(n_components=3, random_state=42)
-    _state["pca3d"]    = pca
-    _state["bank_3d"]  = pca.fit_transform(embs)
+    _state["pca3d"]   = pca
+    _state["bank_3d"] = pca.fit_transform(embs)
+
+
+def _sigmoid(x: float) -> float:
+    x = max(-500.0, min(500.0, x))
+    return 1.0 / (1.0 + math.exp(-x))
 
 
 def _embed(text: str, model, tok) -> np.ndarray:
@@ -239,45 +245,40 @@ class RouteResult:
 
 
 def _compute_risk(question: str, fast: bool) -> tuple:
-    """Returns (risk, gamma_h, d_min, entropy, nearest_q)."""
+    """Returns (risk, emb, d_min, entropy, nearest_q).  No sklearn needed."""
     _ensure_model()
     _ensure_bank()
-    _ensure_pca3d()
 
     model, tok = _state["model"], _state["tok"]
     bank       = _state["bank"]
-    pca3d      = _state["pca3d"]
-    bank_3d    = _state["bank_3d"]
 
-    emb        = _embed(question, model, tok)
-    bank_embs  = np.array([b["emb"] for b in bank])
-    dists      = np.linalg.norm(bank_embs - emb, axis=1)
-    d_min      = float(dists.min())
-    nn_idx     = int(dists.argmin())
+    emb       = _embed(question, model, tok)
+    bank_embs = np.array([b["emb"] for b in bank])
+    dists     = np.linalg.norm(bank_embs - emb, axis=1)
+    d_min     = float(dists.min())
+    nn_idx    = int(dists.argmin())
 
-    from scipy.special import expit as sigmoid
-    risk_d = float(sigmoid(_A * (d_min - _RC)))
-
+    risk_d = _sigmoid(_A * (d_min - _RC))
     ent    = _entropy(question, model, tok) if not fast else 3.5
-    risk_h = float(sigmoid(1.5 * (ent - 3.5)))
+    risk_h = _sigmoid(1.5 * (ent - 3.5))
     risk   = float(np.clip(0.65 * risk_d + 0.35 * risk_h, 0.0, 1.0))
 
-    q_3d    = pca3d.transform(emb[np.newaxis, :])[0]
-    d3d_min = float(np.linalg.norm(bank_3d - q_3d, axis=1).min())
-    gamma_h = float(1.0 - np.exp(-_K * max(d3d_min - _RTH, 0.0)))
-
-    return risk, gamma_h, d_min, ent, bank[nn_idx]["q"]
+    return risk, emb, d_min, ent, bank[nn_idx]["q"]
 
 
 def score(question: str, answer: str = "", *, fast: bool = False) -> CanaryResult:
     """
-    Estimate epistemic risk for a question.
-
-    Returns CanaryResult with .risk in [0, 1].
-    Low risk  → question is within the known knowledge bank.
-    High risk → question is outside known territory; consider RAG or search.
+    Detailed epistemic risk breakdown for a question.
+    Requires scikit-learn (for PCA).  For routing only, prefer route().
     """
-    risk, gamma_h, d_min, ent, nearest_q = _compute_risk(question, fast)
+    risk, emb, d_min, ent, nearest_q = _compute_risk(question, fast)
+
+    _ensure_pca3d()
+    pca3d   = _state["pca3d"]
+    bank_3d = _state["bank_3d"]
+    q_3d    = pca3d.transform(emb[np.newaxis, :])[0]
+    d3d_min = float(np.linalg.norm(bank_3d - q_3d, axis=1).min())
+    gamma_h = float(1.0 - math.exp(-_K * max(d3d_min - _RTH, 0.0)))
 
     if   risk < 0.35: label = "LOW"
     elif risk < 0.65: label = "MEDIUM"
@@ -312,7 +313,7 @@ def route(question: str, *, threshold: float = 0.35, fast: bool = False) -> Rout
         else:
             answer = llm(question)
     """
-    risk, _, _, _, nearest_q = _compute_risk(question, fast)
+    risk, _, _, _, nearest_q = _compute_risk(question, fast)  # no sklearn needed
 
     if risk < threshold:
         action     = "DIRECT_ANSWER"
