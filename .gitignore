@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.env
+.venv/
+env/
+venv/
+canary/data/bank_gpt2.json
+*.json
+!benchmark/truthfulqa_results.json
+.DS_Store
