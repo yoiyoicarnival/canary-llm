@@ -209,11 +209,11 @@ def _entropy(text: str, model, tok, n_tokens: int = 24) -> float:
 
 @dataclass
 class CanaryResult:
-    risk:      float   # composite 0–1  (main signal)
-    gamma_h:   float   # γ(r,d) score
-    d_min:     float   # raw distance to nearest bank entry
-    entropy:   float   # mean generation entropy (nats)
-    nearest_q: str     # nearest bank question
+    risk:      float
+    gamma_h:   float
+    d_min:     float
+    entropy:   float
+    nearest_q: str
     label:     str     # "LOW" / "MEDIUM" / "HIGH" / "VERY HIGH"
 
     def __repr__(self) -> str:
@@ -224,20 +224,22 @@ class CanaryResult:
                 f"  [{bar}] {self.risk*100:.0f}%")
 
 
-def score(question: str, answer: str = "", *, fast: bool = False) -> CanaryResult:
-    """
-    Score a prompt for hallucination risk.
+@dataclass
+class RouteResult:
+    action:     str    # "DIRECT_ANSWER" | "USE_RAG"
+    confidence: float  # certainty of the routing decision (0–1)
+    risk:       float  # raw epistemic risk score
+    nearest_q:  str    # nearest known question in bank
 
-    Args:
-        question: The prompt / user query (required).
-        answer:   LLM-generated response (optional, currently unused in v0.1).
-        fast:     Skip entropy computation (2× faster, slightly less accurate).
+    def __repr__(self) -> str:
+        icon = "✓" if self.action == "DIRECT_ANSWER" else "⟳"
+        return (f"RouteResult({icon} {self.action}  "
+                f"confidence={self.confidence:.2f}  risk={self.risk:.2f}  "
+                f'nearest="{self.nearest_q[:40]}")')
 
-    Returns:
-        CanaryResult with .risk in [0, 1].
-        risk > 0.5  →  flag for review.
-        risk > 0.8  →  likely hallucination territory.
-    """
+
+def _compute_risk(question: str, fast: bool) -> tuple:
+    """Returns (risk, gamma_h, d_min, entropy, nearest_q)."""
     _ensure_model()
     _ensure_bank()
     _ensure_pca3d()
@@ -256,15 +258,26 @@ def score(question: str, answer: str = "", *, fast: bool = False) -> CanaryResul
     from scipy.special import expit as sigmoid
     risk_d = float(sigmoid(_A * (d_min - _RC)))
 
-    ent = _entropy(question, model, tok) if not fast else 3.5
+    ent    = _entropy(question, model, tok) if not fast else 3.5
     risk_h = float(sigmoid(1.5 * (ent - 3.5)))
+    risk   = float(np.clip(0.65 * risk_d + 0.35 * risk_h, 0.0, 1.0))
 
-    risk = float(np.clip(0.65 * risk_d + 0.35 * risk_h, 0.0, 1.0))
-
-    # γ score (unified law in PCA3D)
     q_3d    = pca3d.transform(emb[np.newaxis, :])[0]
     d3d_min = float(np.linalg.norm(bank_3d - q_3d, axis=1).min())
     gamma_h = float(1.0 - np.exp(-_K * max(d3d_min - _RTH, 0.0)))
+
+    return risk, gamma_h, d_min, ent, bank[nn_idx]["q"]
+
+
+def score(question: str, answer: str = "", *, fast: bool = False) -> CanaryResult:
+    """
+    Estimate epistemic risk for a question.
+
+    Returns CanaryResult with .risk in [0, 1].
+    Low risk  → question is within the known knowledge bank.
+    High risk → question is outside known territory; consider RAG or search.
+    """
+    risk, gamma_h, d_min, ent, nearest_q = _compute_risk(question, fast)
 
     if   risk < 0.35: label = "LOW"
     elif risk < 0.65: label = "MEDIUM"
@@ -272,10 +285,76 @@ def score(question: str, answer: str = "", *, fast: bool = False) -> CanaryResul
     else:             label = "VERY HIGH"
 
     return CanaryResult(
-        risk      = risk,
-        gamma_h   = gamma_h,
-        d_min     = d_min,
-        entropy   = ent,
-        nearest_q = bank[nn_idx]["q"],
-        label     = label,
+        risk=risk, gamma_h=gamma_h, d_min=d_min,
+        entropy=ent, nearest_q=nearest_q, label=label,
     )
+
+
+def route(question: str, *, threshold: float = 0.35, fast: bool = False) -> RouteResult:
+    """
+    Decide whether a question needs retrieval (RAG / search / tool) or can be
+    answered directly.
+
+    Args:
+        question:  The user query.
+        threshold: Risk cutoff.  Below → DIRECT_ANSWER; above → USE_RAG.
+                   Default 0.35 balances precision and RAG savings.
+        fast:      Skip entropy (2× faster, slightly lower accuracy).
+
+    Returns:
+        RouteResult with .action and .confidence.
+
+    Example::
+
+        r = canary.route("What is the boiling point of water?")
+        if r.action == "USE_RAG":
+            answer = rag_pipeline(question)
+        else:
+            answer = llm(question)
+    """
+    risk, _, _, _, nearest_q = _compute_risk(question, fast)
+
+    if risk < threshold:
+        action     = "DIRECT_ANSWER"
+        confidence = round(1.0 - risk / threshold, 3)
+    else:
+        action     = "USE_RAG"
+        confidence = round((risk - threshold) / (1.0 - threshold), 3)
+
+    return RouteResult(
+        action=action, confidence=confidence,
+        risk=round(risk, 3), nearest_q=nearest_q,
+    )
+
+
+def load_bank(texts: "list[str]", *, save_path: "str | None" = None) -> None:
+    """
+    Replace the built-in knowledge bank with a custom one.
+
+    Build a bank from your own documents (FAQ, wiki, product docs) so Canary
+    routes questions outside *your* knowledge domain to RAG.
+
+    Args:
+        texts:     List of representative sentences / questions from your corpus.
+        save_path: Optional path to persist the bank as JSON for later reuse.
+
+    Example::
+
+        import canary
+        canary.load_bank([
+            "Our return policy is 30 days.",
+            "We ship to 45 countries.",
+            ...
+        ])
+        r = canary.route("Do you ship to Antarctica?")
+        # RouteResult(⟳ USE_RAG  confidence=0.91 ...)
+    """
+    _ensure_model()
+    model, tok = _state["model"], _state["tok"]
+    bank = [{"q": t, "emb": _embed(t, model, tok)} for t in texts]
+    _state["bank"] = bank
+    _state.pop("pca3d",   None)
+    _state.pop("bank_3d", None)
+    if save_path:
+        with open(save_path, "w") as f:
+            json.dump([{"q": b["q"], "emb": b["emb"].tolist()} for b in bank], f)

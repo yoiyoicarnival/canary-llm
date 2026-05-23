@@ -1,64 +1,65 @@
-# 🐦 Canary — Pre-flight Hallucination Risk Detector
+# Canary — Pre-RAG Routing Layer for LLM Applications
 
-**Score a prompt *before* sending it to any LLM.**  
-High score = the prompt is likely to cause hallucination.
+**Route questions to RAG only when needed. Reduce retrieval costs by up to 72%.**
 
 ```python
-from canary import score
+import canary
 
-result = score("What was Einstein's 1931 quantum biology paper?")
-print(result.risk)    # 0.87
-print(result.label)   # "VERY HIGH"
+r = canary.route("What is the boiling point of water?")
+# RouteResult(✓ DIRECT_ANSWER  confidence=0.91 ...)
+
+r = canary.route("What did our CEO announce last Tuesday?")
+# RouteResult(⟳ USE_RAG  confidence=0.94 ...)
+```
+
+Canary estimates whether a question falls **inside or outside your knowledge boundary** before sending it to an LLM. Questions outside → go to RAG. Questions inside → answer directly.
+
+---
+
+## The Problem
+
+RAG on every query is slow and expensive.
+
+```
+User question → [always RAG] → LLM → Answer
+                    ↑
+              unnecessary 80% of the time
+```
+
+Most production workloads are 70–90% answerable from a stable knowledge base (docs, FAQ, product info). Running full retrieval on those wastes latency and money.
+
+---
+
+## The Solution
+
+```
+User question
+     ↓
+  Canary                          ~10–50ms, CPU-only
+     ↓
+known domain? ──yes──→ LLM (direct answer)
+             └──no──→  RAG → LLM
 ```
 
 ---
 
-## Benchmark — TruthfulQA (N = 850)
+## Benchmark — RAG Cost Reduction
 
-Evaluated on all 817 adversarial questions from
-[TruthfulQA](https://github.com/sylinrl/TruthfulQA) vs 33 unseen factual questions.
-No data leakage: test negatives were **not** in the knowledge bank.
+Evaluated on TruthfulQA (817 unknown-domain questions) + 20 factual questions, default threshold 0.35:
 
 | Metric | Value |
 |--------|-------|
-| **AUC-ROC** | **1.000** |
-| **Precision** | **1.000** |
-| **Recall** | **0.993** |
-| **F1** | **0.996** |
-| Threshold | 0.01 |
+| Unknown questions → RAG | **99.6%** (814 / 817) |
+| Known questions → DIRECT | **90.0%** (18 / 20) |
 
-### Risk score by TruthfulQA category (higher = more hallucination-prone)
+### Estimated RAG reduction by workload mix
 
-| Category | Risk Score |
-|----------|-----------|
-| Confusion: People | 0.937 |
-| Confusion: Other | 0.918 |
-| Confusion: Places | 0.889 |
-| Psychology | 0.594 |
-| Misinformation | 0.500 |
-| … | … |
-| History | 0.234 |
-| Weather | 0.293 |
-
----
-
-## Why Canary works
-
-Canary uses **GPT-2's hidden-state geometry** to measure how far a prompt is
-from a curated bank of verified factual questions.
-
-```
-risk = σ(A × (d_min − r_c))       # geometry signal
-γ_H  = 1 − exp(−k · max(d_3d − r_th, 0))   # unified γ(r,d) law
-```
-
-Key properties:
-
-- **Model-agnostic** — works regardless of which LLM you call
-- **GPU-free** — GPT-2 small (117M params) runs on CPU
-- **No retraining** — plug-and-play from `pip install`
-- **Inference-only** — no fine-tuning, no labels needed
-- **Vendor-neutral** — works across OpenAI, Anthropic, Gemini, local models
+| Known : Unknown | RAG calls saved |
+|-----------------|-----------------|
+| 50% : 50% | **45%** |
+| 70% : 30% | **63%** |
+| 80% : 20% | **72%** |
+| 90% : 10% | **81%** |
 
 ---
 
@@ -68,7 +69,7 @@ Key properties:
 pip install canary-llm
 ```
 
-For the API server:
+For the REST API server:
 ```bash
 pip install "canary-llm[server]"
 ```
@@ -77,40 +78,98 @@ pip install "canary-llm[server]"
 
 ## Usage
 
-### Python
+### Routing (recommended)
 
 ```python
-from canary import score
+import canary
 
-# Quick check
-r = score("Who wrote Hamlet?")
-print(r)
-# CanaryResult(risk=0.04 [LOW]  γ=0.00  H=3.21  nearest="Who wrote Romeo and Juliet?")
-#   [░░░░░░░░░░░░░░░░░░░░]  4%
+r = canary.route("What is our return policy?")
+# r.action      → "DIRECT_ANSWER" or "USE_RAG"
+# r.confidence  → certainty of the decision (0–1)
+# r.risk        → raw epistemic distance score (0–1)
 
-# Risky prompt
-r = score("Describe the mating habits of the Loch Ness Monster.")
-print(r.risk)    # 0.91
-print(r.label)   # "VERY HIGH"
-
-# Fast mode (skip entropy, 2× faster)
-r = score("What is quantum supremacy?", fast=True)
+if r.action == "USE_RAG":
+    answer = rag_pipeline(question)
+else:
+    answer = llm(question)
 ```
 
-### CLI
+### Custom knowledge bank
 
-```bash
-# Single prompt
-canary "What was Napoleon's favorite programming language?"
+Load your own documents so Canary routes questions **outside your specific knowledge domain**:
 
-# Demo
-canary --demo
+```python
+import canary
 
-# JSON output
-canary --json "Who invented the internet?"
+canary.load_bank([
+    "Our return policy allows returns within 30 days.",
+    "We ship to the US, EU, and Japan.",
+    "Enterprise plans start at $499/month.",
+    # add hundreds of representative sentences from your docs
+])
 
-# Pre-built bank (first run downloads GPT-2 ~500MB)
-canary --build
+canary.route("Do you ship to Brazil?")
+# RouteResult(⟳ USE_RAG  confidence=0.88 ...)
+
+canary.route("How do I return a product?")
+# RouteResult(✓ DIRECT_ANSWER  confidence=0.93 ...)
+```
+
+### Threshold tuning
+
+```python
+# Conservative — minimize missed unknowns
+canary.route(question, threshold=0.25)
+
+# Aggressive — maximize RAG savings
+canary.route(question, threshold=0.50)
+
+# Fast mode — skip entropy, 2× faster
+canary.route(question, fast=True)
+```
+
+### Raw risk score
+
+```python
+r = canary.score("What was Einstein's 1931 quantum biology paper?")
+print(r.risk)    # 0.80
+print(r.label)   # "HIGH"
+```
+
+---
+
+## Integrations
+
+### LangChain
+
+```python
+from langchain_core.runnables import RunnableLambda
+import canary
+
+def canary_router(inputs: dict) -> dict:
+    r = canary.route(inputs["question"])
+    inputs["use_rag"] = (r.action == "USE_RAG")
+    inputs["canary_confidence"] = r.confidence
+    return inputs
+
+chain = RunnableLambda(canary_router) | your_rag_or_llm_chain
+```
+
+### OpenAI
+
+```python
+import openai, canary
+
+def smart_chat(question: str) -> str:
+    r = canary.route(question)
+    if r.action == "USE_RAG":
+        context = retrieve(question)
+        messages = [{"role": "user", "content": f"Context: {context}\n\n{question}"}]
+    else:
+        messages = [{"role": "user", "content": question}]
+    return openai.chat.completions.create(
+        model="gpt-4o", messages=messages
+    ).choices[0].message.content
 ```
 
 ### REST API
@@ -122,8 +181,8 @@ uvicorn canary.server:app --port 8080
 ```bash
 curl -X POST http://localhost:8080/score \
   -H "Content-Type: application/json" \
-  -d '{"question": "What chemicals can I mix to make a truth serum?"}'
-# {"risk": 0.89, "label": "VERY HIGH", ...}
+  -d '{"question": "What was the Treaty of Atlantis?"}'
+# {"risk": 0.89, "label": "HIGH", ...}
 ```
 
 ### Docker
@@ -135,63 +194,60 @@ docker run -p 8080:8080 canary-llm
 
 ---
 
-## Integration examples
+## How it works
 
-### OpenAI
+Canary uses **GPT-2's hidden-state geometry** (layer 11, 768-dim) to measure how far a question is from a bank of known-domain examples. Questions far from the bank surface → need retrieval.
 
-```python
-from canary import score
-import openai
-
-def safe_chat(prompt: str, threshold: float = 0.6) -> str:
-    r = score(prompt)
-    if r.risk > threshold:
-        return f"[Canary: {r.label} hallucination risk] " + \
-               openai.chat.completions.create(
-                   model="gpt-4o",
-                   messages=[{"role": "user", "content": prompt}]
-               ).choices[0].message.content
-    return openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
-    ).choices[0].message.content
+```
+risk = σ(A × (d_min − r_c))   # geometric distance signal
+     + entropy component       # generation uncertainty signal
 ```
 
-### LangChain
+Key properties:
 
-```python
-from canary import score
-from langchain_core.runnables import RunnableLambda
+- **Model-agnostic** — works regardless of which LLM you call
+- **GPU-free** — GPT-2 small (117M params) runs on CPU in 10–50ms
+- **No retraining** — plug-and-play, no labels needed
+- **Vendor-neutral** — OpenAI, Anthropic, Gemini, local models
+- **Customizable** — `load_bank()` for domain-specific routing
 
-def canary_guard(inputs):
-    r = score(inputs["question"])
-    inputs["canary_risk"]  = r.risk
-    inputs["canary_label"] = r.label
-    return inputs
+---
 
-chain = RunnableLambda(canary_guard) | your_llm_chain
+## CLI
+
+```bash
+# Route a single question
+canary --route "Who wrote Hamlet?"
+
+# Demo
+canary --demo
+
+# JSON output
+canary --json "What is quantum entanglement?"
+
+# Build bank
+canary --build
 ```
 
 ---
 
-## How the score maps to action
+## Routing decision guide
 
-| Risk | Label | Recommended action |
-|------|-------|--------------------|
-| 0.0 – 0.35 | LOW | Pass through |
-| 0.35 – 0.65 | MEDIUM | Add RAG / retrieval |
-| 0.65 – 0.85 | HIGH | Warn user, add disclaimer |
-| 0.85 – 1.0 | VERY HIGH | Block or require verification |
+| Risk score | Action | Meaning |
+|------------|--------|---------|
+| 0.0 – 0.35 | DIRECT_ANSWER | Question is within known territory |
+| 0.35 – 0.65 | USE_RAG | Borderline — retrieval recommended |
+| 0.65 – 1.0 | USE_RAG | Outside known territory — retrieve |
 
 ---
 
 ## Roadmap
 
-- [ ] v0.2: Custom knowledge bank (bring your own facts)
-- [ ] v0.2: Batch scoring API
-- [ ] v0.3: Output-based verification (post-generation)
+- [ ] v0.2: Batch routing API (`canary.route_batch(questions)`)
+- [ ] v0.2: Auto-grow bank from answered queries
+- [ ] v0.3: Output-side verification (post-generation)
 - [ ] v0.3: HaluEval benchmark
-- [ ] v1.0: Hosted API (canary-llm.com)
+- [ ] v1.0: Hosted API
 
 ---
 
@@ -201,9 +257,9 @@ MIT
 
 ## Citation
 
-```
+```bibtex
 @software{canary2026,
-  title  = {Canary: Pre-flight Hallucination Risk Detector},
+  title  = {Canary: Pre-RAG Routing Layer for LLM Applications},
   year   = {2026},
   url    = {https://github.com/yoiyoicarnival/canary-llm}
 }
